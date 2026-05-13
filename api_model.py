@@ -329,49 +329,83 @@ def complete_history_with_weather(input_history, required_samples=24):
 # =========================
 # FORECAST API
 # =========================
-def weather_code_to_label(code):
+def weather_code_to_label(code, rain_probability=0, rain_sum=0):
     code = int(code)
+    rain_probability = float(rain_probability or 0)
+    rain_sum = float(rain_sum or 0)
 
     if code == 0:
         return "Trời quang"
+
     if code in [1, 2]:
         return "Ít mây"
+
     if code == 3:
         return "Âm u"
+
     if code in [45, 48]:
         return "Sương mù"
+
     if code in [51, 53, 55, 56, 57]:
         return "Mưa phùn"
+
     if code in [61, 63, 65, 66, 67]:
+        if rain_probability < 20 and rain_sum < 1:
+            return "Ít mây"
         return "Mưa"
+
     if code in [80, 81, 82]:
+        if rain_probability < 20 and rain_sum < 1:
+            return "Ít mây"
         return "Mưa rào"
+
     if code in [95, 96, 99]:
-        return "Dông"
+        if rain_probability >= 60 or rain_sum >= 5:
+            return "Dông"
+        if rain_probability >= 25 or rain_sum >= 1:
+            return "Mưa rào"
+        return "Ít mây"
 
     return "Không rõ"
 
-
-def weather_code_to_icon(code):
+def weather_code_to_icon(code, rain_probability=0, rain_sum=0):
     code = int(code)
+    rain_probability = float(rain_probability or 0)
+    rain_sum = float(rain_sum or 0)
 
     if code == 0:
         return "sunny"
+
     if code in [1, 2]:
         return "partly_cloudy"
+
     if code == 3:
         return "cloudy"
+
     if code in [45, 48]:
         return "fog"
+
     if code in [51, 53, 55, 56, 57]:
         return "drizzle"
-    if code in [61, 63, 65, 66, 67, 80, 81, 82]:
-        return "rain"
+
+    if code in [61, 63, 65, 66, 67]:
+        if rain_probability >= 50 or rain_sum >= 2:
+            return "rain"
+        return "partly_cloudy"
+
+    if code in [80, 81, 82]:
+        if rain_probability >= 50 or rain_sum >= 2:
+            return "rain"
+        return "partly_cloudy"
+
     if code in [95, 96, 99]:
-        return "thunderstorm"
+        if rain_probability >= 60 or rain_sum >= 5:
+            return "thunderstorm"
+        if rain_probability >= 25 or rain_sum >= 1:
+            return "rain"
+        return "partly_cloudy"
 
     return "partly_cloudy"
-
 
 def day_name_vi(date_text, index):
     if index == 0:
@@ -435,21 +469,48 @@ def fetch_open_meteo_forecast(days=5):
 
     for i in range(len(dates)):
         code = int(codes[i] or 0)
-
+        rain_probability_value = float(rain_prob[i] or 0)
+        rain_sum_value = float(rain_sum[i] or 0)
+    
+        weather_label = weather_code_to_label(
+            code,
+            rain_probability=rain_probability_value,
+            rain_sum=rain_sum_value,
+        )
+    
+        weather_icon = weather_code_to_icon(
+            code,
+            rain_probability=rain_probability_value,
+            rain_sum=rain_sum_value,
+        )
+    
         daily_result.append({
             "date": dates[i],
             "day_name": day_name_vi(dates[i], i),
             "weather_code": code,
-            "weather": weather_code_to_label(code),
-            "icon": weather_code_to_icon(code),
+            "weather": weather_label,
+            "icon": weather_icon,
             "temp_max": float(temp_max[i] or 0),
             "temp_min": float(temp_min[i] or 0),
-            "rain_probability": float(rain_prob[i] or 0),
-            "rain_sum": float(rain_sum[i] or 0),
+            "rain_probability": rain_probability_value,
+            "rain_sum": rain_sum_value,
         })
 
-    current_code = int(current.get("weather_code") or 0)
-
+        current_code = int(current.get("weather_code") or 0)
+        current_rain = float(current.get("rain") or 0)
+    
+    current_weather_label = weather_code_to_label(
+        current_code,
+        rain_probability=0,
+        rain_sum=current_rain,
+    )
+    
+    current_weather_icon = weather_code_to_icon(
+        current_code,
+        rain_probability=0,
+        rain_sum=current_rain,
+    )
+    
     return {
         "ok": True,
         "location": "Hanoi, Vietnam",
@@ -461,10 +522,10 @@ def fetch_open_meteo_forecast(days=5):
             "temperature": float(current.get("temperature_2m") or 0),
             "humidity": float(current.get("relative_humidity_2m") or 0),
             "pressure": float(current.get("surface_pressure") or 0),
-            "rain": float(current.get("rain") or 0),
+            "rain": current_rain,
             "weather_code": current_code,
-            "weather": weather_code_to_label(current_code),
-            "icon": weather_code_to_icon(current_code),
+            "weather": current_weather_label,
+            "icon": current_weather_icon,
         },
         "daily": daily_result,
     }
