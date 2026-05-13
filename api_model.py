@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 import os
@@ -19,7 +19,6 @@ HISTORY_CSV = "sensor_history.csv"
 MIN_HISTORY = 24
 
 # Vị trí mặc định: Hà Nội
-# Nếu đặt hệ thống ở nơi khác thì đổi latitude, longitude
 LATITUDE = 21.0285
 LONGITUDE = 105.8542
 TIMEZONE = "Asia/Bangkok"
@@ -91,14 +90,20 @@ class IngestInput(BaseModel):
 
 
 class PredictRequest(BaseModel):
-    history: List[SensorRow] = []
+    history: List[SensorRow] = Field(default_factory=list)
+
+
+def dump_model(obj):
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    return obj.dict()
 
 
 # =========================
 # HISTORY FUNCTIONS
 # =========================
 def normalize_sensor_row(data: IngestInput):
-    row = data.model_dump()
+    row = dump_model(data)
 
     if row.get("time") is None:
         row["time"] = datetime.now().isoformat()
@@ -138,11 +143,7 @@ def append_history(row):
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
     df = df.dropna(subset=["time"])
     df = df.sort_values("time")
-
-    # Tránh trùng thời gian tuyệt đối
     df = df.drop_duplicates(subset=["time"], keep="last")
-
-    # Giữ tối đa 1000 mẫu gần nhất
     df = df.tail(1000)
 
     df.to_csv(HISTORY_CSV, index=False)
@@ -167,13 +168,9 @@ def read_history(limit=24):
 
 
 # =========================
-# OPEN-METEO FUNCTIONS
+# OPEN-METEO HISTORY
 # =========================
-def fetch_open_meteo_history(hours=48):
-    """
-    Lấy dữ liệu thời tiết theo giờ từ Open-Meteo.
-    Dùng để bù khi cảm biến chưa đủ 24 mẫu.
-    """
+def fetch_open_meteo_history(hours=72):
     url = "https://api.open-meteo.com/v1/forecast"
 
     params = {
@@ -214,13 +211,9 @@ def fetch_open_meteo_history(hours=48):
             "temperature": float(temps[i] or 0),
             "humidity": float(hums[i] or 0),
             "pressure": float(pressures[i] or 0),
-
-            # Open-Meteo không có lux giống cảm biến.
-            # Tạm dùng shortwave_radiation để đại diện cho ánh sáng.
             "light": float(radiation[i] or 0),
-
             "rain": 1.0 if rain_value > 0 else 0.0,
-            "source": "meteo",
+            "source": "weather",
         })
 
     df = pd.DataFrame(rows)
@@ -241,70 +234,60 @@ def prepare_sensor_history(input_history):
     if sensor_df.empty:
         return sensor_df
 
-    sensor_df["time"] = pd.to_datetime(sensor_df["time"], errors="coerce")
-    sensor_df = sensor_df.dropna(subset=["time"])
-    sensor_df = sensor_df.sort_values("time")
-
     needed_cols = ["time", "temperature", "humidity", "pressure", "light", "rain"]
 
     for col in needed_cols:
         if col not in sensor_df.columns:
             if col == "time":
-                sensor_df[col] = pd.Timestamp.now()
+                sensor_df[col] = datetime.now().isoformat()
             else:
                 sensor_df[col] = 0
 
     sensor_df = sensor_df[needed_cols]
+    sensor_df["time"] = pd.to_datetime(sensor_df["time"], errors="coerce")
+    sensor_df = sensor_df.dropna(subset=["time"])
 
     for col in ["temperature", "humidity", "pressure", "light", "rain"]:
         sensor_df[col] = pd.to_numeric(sensor_df[col], errors="coerce").fillna(0)
 
-    # Gộp theo giờ, ưu tiên mẫu cảm biến mới nhất trong giờ đó
+    sensor_df = sensor_df.sort_values("time")
     sensor_df["time_hour"] = sensor_df["time"].dt.floor("h")
     sensor_df = sensor_df.drop_duplicates(subset=["time_hour"], keep="last")
     sensor_df = sensor_df.drop(columns=["time_hour"])
-
     sensor_df["source"] = "sensor"
 
     return sensor_df
 
 
-def complete_history_with_meteo(input_history, required_samples=24):
-    """
-    Ưu tiên dữ liệu cảm biến.
-    Nếu cảm biến chưa đủ 24 mẫu thì lấy Open-Meteo để bù các giờ còn thiếu.
-    """
+def complete_history_with_weather(input_history, required_samples=24):
     sensor_df = prepare_sensor_history(input_history)
 
     if len(sensor_df) >= required_samples:
         final_df = sensor_df.sort_values("time").tail(required_samples)
 
         return final_df, {
-            "used_meteo": False,
             "sensor_samples": int(len(sensor_df)),
-            "meteo_samples_added": 0,
+            "external_samples": 0,
             "final_samples": int(len(final_df)),
         }
 
     try:
-        meteo_df = fetch_open_meteo_history(hours=72)
-        meteo_error = None
+        weather_df = fetch_open_meteo_history(hours=72)
+        weather_error = None
     except Exception as e:
-        meteo_df = pd.DataFrame()
-        meteo_error = str(e)
+        weather_df = pd.DataFrame()
+        weather_error = str(e)
 
-    if meteo_df.empty:
+    if weather_df.empty:
         final_df = sensor_df.sort_values("time").tail(required_samples)
 
         return final_df, {
-            "used_meteo": False,
             "sensor_samples": int(len(sensor_df)),
-            "meteo_samples_added": 0,
+            "external_samples": 0,
             "final_samples": int(len(final_df)),
-            "meteo_error": meteo_error or "Open-Meteo không trả dữ liệu.",
+            "weather_error": weather_error or "Không lấy được dữ liệu thời tiết.",
         }
 
-    # Chuẩn hóa theo từng giờ
     if not sensor_df.empty:
         sensor_df["time_hour"] = sensor_df["time"].dt.floor("h")
     else:
@@ -312,15 +295,14 @@ def complete_history_with_meteo(input_history, required_samples=24):
             columns=["time", "temperature", "humidity", "pressure", "light", "rain", "source", "time_hour"]
         )
 
-    meteo_df["time_hour"] = meteo_df["time"].dt.floor("h")
+    weather_df["time_hour"] = weather_df["time"].dt.floor("h")
 
-    # Bỏ các giờ Meteo bị trùng với giờ đã có cảm biến
     sensor_hours = set(sensor_df["time_hour"].tolist()) if not sensor_df.empty else set()
-    meteo_fill = meteo_df[~meteo_df["time_hour"].isin(sensor_hours)].copy()
+    weather_fill = weather_df[~weather_df["time_hour"].isin(sensor_hours)].copy()
 
     combined = pd.concat(
         [
-            meteo_fill[["time", "temperature", "humidity", "pressure", "light", "rain", "source"]],
+            weather_fill[["time", "temperature", "humidity", "pressure", "light", "rain", "source"]],
             sensor_df[["time", "temperature", "humidity", "pressure", "light", "rain", "source"]],
         ],
         ignore_index=True
@@ -328,24 +310,163 @@ def complete_history_with_meteo(input_history, required_samples=24):
 
     combined["time"] = pd.to_datetime(combined["time"], errors="coerce")
     combined = combined.dropna(subset=["time"])
-    combined = combined.sort_values("time")
-
-    # Nếu vẫn trùng thời gian thì giữ mẫu cảm biến
     combined["priority"] = combined["source"].apply(lambda x: 1 if x == "sensor" else 0)
     combined["time_hour"] = combined["time"].dt.floor("h")
     combined = combined.sort_values(["time_hour", "priority", "time"])
     combined = combined.drop_duplicates(subset=["time_hour"], keep="last")
 
     final_df = combined.sort_values("time").tail(required_samples)
-
-    meteo_added = int((final_df["source"] == "meteo").sum()) if "source" in final_df.columns else 0
+    external_count = int((final_df["source"] == "weather").sum()) if "source" in final_df.columns else 0
 
     return final_df, {
-        "used_meteo": meteo_added > 0,
         "sensor_samples": int(len(sensor_df)),
-        "meteo_samples_added": meteo_added,
+        "external_samples": external_count,
         "final_samples": int(len(final_df)),
-        "meteo_error": meteo_error,
+        "weather_error": weather_error,
+    }
+
+
+# =========================
+# FORECAST API
+# =========================
+def weather_code_to_label(code):
+    code = int(code)
+
+    if code == 0:
+        return "Trời quang"
+    if code in [1, 2]:
+        return "Ít mây"
+    if code == 3:
+        return "Âm u"
+    if code in [45, 48]:
+        return "Sương mù"
+    if code in [51, 53, 55, 56, 57]:
+        return "Mưa phùn"
+    if code in [61, 63, 65, 66, 67]:
+        return "Mưa"
+    if code in [80, 81, 82]:
+        return "Mưa rào"
+    if code in [95, 96, 99]:
+        return "Dông"
+
+    return "Không rõ"
+
+
+def weather_code_to_icon(code):
+    code = int(code)
+
+    if code == 0:
+        return "sunny"
+    if code in [1, 2]:
+        return "partly_cloudy"
+    if code == 3:
+        return "cloudy"
+    if code in [45, 48]:
+        return "fog"
+    if code in [51, 53, 55, 56, 57]:
+        return "drizzle"
+    if code in [61, 63, 65, 66, 67, 80, 81, 82]:
+        return "rain"
+    if code in [95, 96, 99]:
+        return "thunderstorm"
+
+    return "partly_cloudy"
+
+
+def day_name_vi(date_text, index):
+    if index == 0:
+        return "Hôm nay"
+
+    dt = pd.to_datetime(date_text)
+
+    names = {
+        0: "Thứ 2",
+        1: "Thứ 3",
+        2: "Thứ 4",
+        3: "Thứ 5",
+        4: "Thứ 6",
+        5: "Thứ 7",
+        6: "CN",
+    }
+
+    return names.get(dt.weekday(), "--")
+
+
+def fetch_open_meteo_forecast(days=5):
+    url = "https://api.open-meteo.com/v1/forecast"
+
+    params = {
+        "latitude": LATITUDE,
+        "longitude": LONGITUDE,
+        "timezone": TIMEZONE,
+        "forecast_days": days,
+        "current": ",".join([
+            "temperature_2m",
+            "relative_humidity_2m",
+            "weather_code",
+            "surface_pressure",
+            "rain"
+        ]),
+        "daily": ",".join([
+            "weather_code",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "precipitation_probability_max",
+            "rain_sum"
+        ])
+    }
+
+    response = requests.get(url, params=params, timeout=15)
+    response.raise_for_status()
+
+    data = response.json()
+
+    current = data.get("current", {})
+    daily = data.get("daily", {})
+
+    dates = daily.get("time", [])
+    codes = daily.get("weather_code", [])
+    temp_max = daily.get("temperature_2m_max", [])
+    temp_min = daily.get("temperature_2m_min", [])
+    rain_prob = daily.get("precipitation_probability_max", [])
+    rain_sum = daily.get("rain_sum", [])
+
+    daily_result = []
+
+    for i in range(len(dates)):
+        code = int(codes[i] or 0)
+
+        daily_result.append({
+            "date": dates[i],
+            "day_name": day_name_vi(dates[i], i),
+            "weather_code": code,
+            "weather": weather_code_to_label(code),
+            "icon": weather_code_to_icon(code),
+            "temp_max": float(temp_max[i] or 0),
+            "temp_min": float(temp_min[i] or 0),
+            "rain_probability": float(rain_prob[i] or 0),
+            "rain_sum": float(rain_sum[i] or 0),
+        })
+
+    current_code = int(current.get("weather_code") or 0)
+
+    return {
+        "ok": True,
+        "location": "Hanoi, Vietnam",
+        "latitude": LATITUDE,
+        "longitude": LONGITUDE,
+        "timezone": TIMEZONE,
+        "current": {
+            "time": current.get("time"),
+            "temperature": float(current.get("temperature_2m") or 0),
+            "humidity": float(current.get("relative_humidity_2m") or 0),
+            "pressure": float(current.get("surface_pressure") or 0),
+            "rain": float(current.get("rain") or 0),
+            "weather_code": current_code,
+            "weather": weather_code_to_label(current_code),
+            "icon": weather_code_to_icon(current_code),
+        },
+        "daily": daily_result,
     }
 
 
@@ -353,7 +474,7 @@ def complete_history_with_meteo(input_history, required_samples=24):
 # FEATURE ENGINEERING
 # =========================
 def build_features(history_rows):
-    df = pd.DataFrame([row.model_dump() for row in history_rows])
+    df = pd.DataFrame([dump_model(row) for row in history_rows])
 
     if "time" not in df.columns or df["time"].isna().all():
         df["time"] = pd.date_range(
@@ -459,11 +580,8 @@ def home():
         "model": BUNDLE_PATH,
         "history_file": HISTORY_CSV,
         "min_history": MIN_HISTORY,
-        "meteo": {
-            "latitude": LATITUDE,
-            "longitude": LONGITUDE,
-            "timezone": TIMEZONE,
-        }
+        "forecast_endpoint": "/forecast?days=5",
+        "predict_endpoint": "/predict",
     }
 
 
@@ -511,6 +629,11 @@ def get_history(limit: int = 24):
 
 @app.get("/meteo")
 def get_meteo(hours: int = 24):
+    if hours < 1:
+        hours = 1
+    if hours > 72:
+        hours = 72
+
     df = fetch_open_meteo_history(hours=hours)
 
     data = []
@@ -523,7 +646,7 @@ def get_meteo(hours: int = 24):
             "pressure": float(row["pressure"]),
             "light": float(row["light"]),
             "rain": float(row["rain"]),
-            "source": row.get("source", "meteo"),
+            "source": row.get("source", "weather"),
         })
 
     return {
@@ -533,11 +656,21 @@ def get_meteo(hours: int = 24):
     }
 
 
+@app.get("/forecast")
+def get_forecast(days: int = 5):
+    if days < 1:
+        days = 1
+
+    if days > 7:
+        days = 7
+
+    return fetch_open_meteo_forecast(days=days)
+
+
 @app.post("/predict")
 def predict(req: PredictRequest):
-    input_history = [row.model_dump() for row in req.history]
+    input_history = [dump_model(row) for row in req.history]
 
-    # Nếu request gửi chưa đủ 24 mẫu thì lấy thêm từ sensor_history.csv
     if len(input_history) < MIN_HISTORY:
         old_df = read_history(MIN_HISTORY)
 
@@ -548,8 +681,7 @@ def predict(req: PredictRequest):
 
             input_history = old_history + input_history
 
-    # Nếu vẫn chưa đủ thì tự gọi Open-Meteo để bù
-    hist_df, source_info = complete_history_with_meteo(
+    hist_df, source_info = complete_history_with_weather(
         input_history,
         required_samples=MIN_HISTORY
     )
@@ -559,7 +691,7 @@ def predict(req: PredictRequest):
     if len(hist_df) < MIN_HISTORY:
         return {
             "ok": False,
-            "error": "Chưa đủ dữ liệu lịch sử để dự đoán, kể cả sau khi bù bằng Open-Meteo.",
+            "error": "Chưa đủ dữ liệu lịch sử để dự đoán.",
             "required_samples": MIN_HISTORY,
             "received_samples": len(hist_df),
             "source_info": source_info,
@@ -593,6 +725,7 @@ def predict(req: PredictRequest):
     command = decide_command(weather_label, rain_probability)
 
     history_used = []
+
     for _, row in hist_df.iterrows():
         history_used.append({
             "time": row["time"].isoformat() if hasattr(row["time"], "isoformat") else str(row["time"]),
